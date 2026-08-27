@@ -5,8 +5,8 @@
 Surfactant natively decompresses common archives (ZIP/TAR/GZIP/BZIP2/XZ/RAR) via
 ``file_decompression.py``. This plugin extends that idea to firmware and embedded
 container formats that OFRAK knows how to unpack (SquashFS, CramFS, JFFS2, UBI/UBIFS,
-romfs, ext filesystems, U-Boot uImage, Android boot images, CPIO, device tree blobs,
-etc.).
+ext filesystems, U-Boot uImage, OpenWrt TRX, 7-Zip, ISO 9660, UEFI firmware volumes,
+UF2, CPIO, device tree blobs, zstd/lz4/lzop streams, etc.).
 
 It works exactly like the built-in decompressor: it unpacks the container to a
 temporary directory and pushes ``ContextEntry`` objects onto Surfactant's
@@ -21,7 +21,9 @@ warning and skips unpacking.
 
 from __future__ import annotations
 
+import importlib.util
 import pathlib
+import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +45,9 @@ if TYPE_CHECKING:
 # ``signatures`` is a tuple of byte strings; a match at ``offset`` for any of them
 # identifies the type. These are the non-native container formats that OFRAK can
 # unpack but Surfactant does not handle on its own.
+#
+# ROMFS and Android boot images were intentionally dropped: OFRAK's core has no
+# unpacker for them, so identifying them here only produced empty extractions.
 _MAGIC_SIGNATURES: dict[str, tuple[int, tuple[bytes, ...]]] = {
     # SquashFS: "hsqs" (little-endian) or "sqsh" (big-endian) at offset 0
     "SQUASHFS": (0, (b"hsqs", b"sqsh")),
@@ -50,21 +55,29 @@ _MAGIC_SIGNATURES: dict[str, tuple[int, tuple[bytes, ...]]] = {
     "CRAMFS": (0, (b"\x45\x3d\xcd\x28",)),
     # JFFS2: 0x1985 as either endianness at offset 0
     "JFFS2": (0, (b"\x85\x19", b"\x19\x85")),
-    # UBI volume ("UBI#") and UBIFS ("UBI!") at offset 0
+    # UBI volume ("UBI#") and UBIFS at offset 0
     "UBI": (0, (b"UBI#",)),
     "UBIFS": (0, (b"\x31\x18\x10\x06",)),
-    # romfs
-    "ROMFS": (0, (b"-rom1fs-",)),
     # U-Boot legacy uImage: magic 0x27051956 at offset 0
     "UIMAGE": (0, (b"\x27\x05\x19\x56",)),
-    # Android boot image
-    "ANDROID_BOOT": (0, (b"ANDROID!",)),
+    # OpenWrt TRX firmware: magic "HDR0" (0x30524448 little-endian) at offset 0
+    "OPENWRT_TRX": (0, (b"HDR0",)),
     # Device tree blob (FDT): 0xd00dfeed at offset 0
     "DTB": (0, (b"\xd0\x0d\xfe\xed",)),
     # CPIO archives (newc/crc ASCII and old binary)
     "CPIO": (0, (b"070701", b"070702", b"070707", b"\xc7\x71")),
     # YAFFS2 object header (first record is typically a directory named for the root)
     "YAFFS": (0, (b"\x03\x00\x00\x00\x01\x00\x00\x00\xff\xff",)),
+    # 7-Zip archive (not decompressed natively by Surfactant): magic at offset 0
+    "SEVENZIP": (0, (b"7z\xbc\xaf\x27\x1c",)),
+    # UF2 flashing format: first-block magic 0x0A324655 ("UF2\n") at offset 0
+    "UF2": (0, (b"\x55\x46\x32\x0a",)),
+    # Zstandard frame: magic 0xFD2FB528 stored little-endian at offset 0
+    "ZSTD": (0, (b"\x28\xb5\x2f\xfd",)),
+    # lzop (.lzo): magic \x89LZO\x00\r\n\x1a\n at offset 0
+    "LZOP": (0, (b"\x89\x4c\x5a\x4f\x00\x0d\x0a\x1a\x0a",)),
+    # UEFI firmware volume: "_FVH" signature at offset 0x28
+    "UEFI": (0x28, (b"_FVH",)),
     # GPT-partitioned disk image: "EFI PART" at LBA 1 (offset 0x200)
     "GPT": (0x200, (b"EFI PART",)),
 }
@@ -73,6 +86,11 @@ _MAGIC_SIGNATURES: dict[str, tuple[int, tuple[bytes, ...]]] = {
 _EXT_MAGIC_OFFSET = 0x438
 _EXT_MAGIC = b"\x53\xef"
 
+# ISO 9660 primary volume descriptor: "CD001" at offset 0x8001, handled specially
+# because it sits far past the header read used for the offset-0 signatures.
+_ISO_MAGIC_OFFSET = 0x8001
+_ISO_MAGIC = b"CD001"
+
 # MBR-partitioned disk image: 0x55AA boot signature at offset 0x1FE with at least
 # one non-empty partition table entry (checked specially to reduce false positives).
 _MBR_SIG_OFFSET = 0x1FE
@@ -80,10 +98,30 @@ _MBR_SIG = b"\x55\xaa"
 _MBR_PART_TABLE_OFFSET = 0x1BE
 
 # The set of labels this plugin knows how to unpack.
-_SUPPORTED_TYPES = frozenset(_MAGIC_SIGNATURES) | {"EXT", "DISK_IMAGE"}
+_SUPPORTED_TYPES = frozenset(_MAGIC_SIGNATURES) | {"EXT", "DISK_IMAGE", "ISO9660", "IHEX"}
 
 _METADATA_KEY = "ofrakUnpacker"
 _SETTINGS_SECTION = "ofrak_unpacker"
+
+# External CLI tools that OFRAK unpackers shell out to for the formats this plugin
+# detects (verified against ``python -m ofrak deps``). These must be present on
+# PATH for extraction of the corresponding formats to succeed. Package hints are
+# for Debian/Ubuntu. Maps tool -> (formats, install hint).
+_EXTERNAL_TOOLS: dict[str, tuple[str, str]] = {
+    "unsquashfs": ("SQUASHFS", "apt install squashfs-tools"),
+    "jefferson": ("JFFS2", "pip install jefferson"),
+    "debugfs": ("EXT", "apt install e2fsprogs"),
+    "7zz": ("SEVENZIP/CRAMFS/ISO9660", "apt install 7zip (or download from 7-zip.org)"),
+    "lzop": ("LZOP", "apt install lzop"),
+    "zstd": ("ZSTD", "apt install zstd"),
+    "uefiextract": ("UEFI", "download from https://github.com/LongSoft/UEFITool/releases"),
+}
+
+# Python modules certain OFRAK unpackers import directly (not PATH tools).
+# Maps importable module name -> (formats, install hint).
+_PYTHON_DEPS: dict[str, tuple[str, str]] = {
+    "lzo": ("UBI/UBIFS", "apt install liblzo2-dev && pip install python-lzo"),
+}
 
 # ---------------------------------------------------------------------------
 # Extraction bookkeeping
@@ -222,12 +260,39 @@ def supports_file(filetype: list[str] | None) -> list[str] | None:
     return supported or None
 
 
+def _looks_like_ihex(header: bytes) -> bool:
+    """Validate that ``header`` begins with a well-formed Intel HEX record.
+
+    Intel HEX is ASCII, so a bare ``:`` prefix is far too weak. This parses the
+    first record and verifies its length field, record type, and checksum to
+    avoid misidentifying arbitrary text files that happen to start with a colon.
+    """
+    if not header.startswith(b":"):
+        return False
+    line = header[1:].split(b"\n", 1)[0].rstrip(b"\r")
+    if len(line) < 10 or len(line) % 2 != 0:
+        return False
+    try:
+        raw = bytes.fromhex(line.decode("ascii"))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    byte_count = raw[0]
+    record_type = raw[3]
+    if record_type > 0x05 or len(raw) != byte_count + 5:
+        return False
+    return sum(raw) & 0xFF == 0
+
+
 @surfactant.plugin.hookimpl
 def identify_file_type(filepath: str, context: ContextEntry | None = None) -> list[str] | None:
     """Identify non-native firmware/container formats by magic bytes."""
     try:
         with pathlib.Path(filepath).open("rb") as f:
             header = f.read(1088)  # covers all offset-0 sigs plus the ext superblock
+            # ISO 9660's primary volume descriptor sits far past the header read,
+            # so grab just its signature separately (empty read past EOF is fine).
+            f.seek(_ISO_MAGIC_OFFSET)
+            iso_window = f.read(len(_ISO_MAGIC))
     except OSError:
         return None
 
@@ -239,6 +304,12 @@ def identify_file_type(filepath: str, context: ContextEntry | None = None) -> li
 
     if header[_EXT_MAGIC_OFFSET : _EXT_MAGIC_OFFSET + 2] == _EXT_MAGIC:
         matches.append("EXT")
+
+    if iso_window == _ISO_MAGIC:
+        matches.append("ISO9660")
+
+    if _looks_like_ihex(header):
+        matches.append("IHEX")
 
     # MBR disk image: boot signature plus a partition table entry with a non-zero
     # partition type byte (offset +4 within a 16-byte entry). GPT protective MBRs
@@ -264,6 +335,65 @@ def _ofrak_available() -> bool:
     except ImportError:
         return False
     return True
+
+
+async def _mapped_coverage(root_resource: Any) -> tuple[int, float] | None:
+    """Return ``(image_size, covered_fraction)`` for an unpacked OFRAK resource.
+
+    Coverage is the fraction of the original image's bytes that OFRAK mapped to
+    child resources. Only byte-mapped children are counted: content that OFRAK
+    decodes/decompresses into a separate data space (e.g. files inside a
+    compressed filesystem) is not mapped back onto the image, so an image that is
+    itself a single recognized container reports full (1.0) coverage. Unidentified
+    gaps (padding, unknown blobs) are left uncovered and lower the fraction.
+    """
+    try:
+        image_size = await root_resource.get_data_length()
+    except Exception:  # noqa: BLE001
+        return None
+    if not image_size:
+        return None
+
+    intervals: list[tuple[int, int]] = []
+
+    async def _walk(res: Any, base: int) -> None:
+        try:
+            children = await res.get_children()
+        except Exception:  # noqa: BLE001
+            return
+        for child in children:
+            try:
+                rng = await child.get_data_range_within_parent()
+            except Exception:  # noqa: BLE001
+                continue
+            # A zero-length range marks an unmapped (decoded) child that lives in
+            # its own data space, so it contributes no original-image bytes.
+            if rng.length() <= 0:
+                continue
+            start = base + rng.start
+            end = base + rng.end
+            if start < 0 or end > image_size or end <= start:
+                continue
+            intervals.append((start, end))
+            await _walk(child, start)
+
+    await _walk(root_resource, 0)
+
+    if not intervals:
+        # No mapped sub-regions: the whole image is one recognized container.
+        return image_size, 1.0
+
+    intervals.sort()
+    covered = 0
+    cur_start, cur_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start > cur_end:
+            covered += cur_end - cur_start
+            cur_start, cur_end = start, end
+        else:
+            cur_end = max(cur_end, end)
+    covered += cur_end - cur_start
+    return image_size, covered / image_size
 
 
 def _unpack_fs_with_ofrak(filename: str, out_dir: str) -> dict[str, Any]:
@@ -320,6 +450,12 @@ def _unpack_fs_with_ofrak(filename: str, out_dir: str) -> dict[str, Any]:
         summary["extractedFileCount"] = sum(
             1 for p in pathlib.Path(out_dir).rglob("*") if p.is_file()
         )
+
+        coverage = await _mapped_coverage(root)
+        if coverage is not None:
+            image_size, fraction = coverage
+            summary["imageSize"] = image_size
+            summary["coveragePercent"] = round(fraction * 100, 2)
 
     ofrak.OFRAK().run(_run)
     return summary
@@ -392,12 +528,17 @@ def extract_file_info(
         logger.info(
             f"Carved {len(partitions)} partition(s) from {supported} '{filename}' -> {out_dir}"
         )
+        image_size = pathlib.Path(filename).stat().st_size
+        covered = sum(int(p.get("length", 0)) for p in partitions)
+        coverage_percent = round(covered / image_size * 100, 2) if image_size else None
         return {
             _METADATA_KEY: {
                 "detectedFormats": supported,
                 "unpacked": True,
                 "extractPath": out_dir,
                 "partitions": partitions,
+                "imageSize": image_size,
+                "coveragePercent": coverage_percent,
             }
         }
 
@@ -448,3 +589,47 @@ def extract_file_info(
 @surfactant.plugin.hookimpl
 def short_name() -> str:
     return "ofrak_unpacker"
+
+
+@surfactant.plugin.hookimpl
+def settings_name() -> str:
+    return _SETTINGS_SECTION
+
+
+@surfactant.plugin.hookimpl
+def init_hook(command_name: str | None = None) -> None:
+    """Warn once about missing OFRAK dependencies before extraction runs.
+
+    Only the ``generate`` command performs extraction, so the checks are skipped
+    for unrelated commands to avoid spurious warnings.
+    """
+    if command_name not in (None, "generate"):
+        return
+
+    if not _ofrak_available():
+        logger.warning(
+            "ofrak_unpacker: OFRAK is not installed; firmware/container formats "
+            "will still be identified but cannot be unpacked. Install with "
+            "'pip install ofrak' to enable extraction."
+        )
+        return
+
+    missing = [
+        f"{tool} [{fmt}] (install: {hint})"
+        for tool, (fmt, hint) in _EXTERNAL_TOOLS.items()
+        if shutil.which(tool) is None
+    ]
+    missing += [
+        f"{module} [{fmt}] (install: {hint})"
+        for module, (fmt, hint) in _PYTHON_DEPS.items()
+        if importlib.util.find_spec(module) is None
+    ]
+    if missing:
+        logger.warning(
+            "ofrak_unpacker: the following OFRAK unpacking dependencies were not "
+            "found; the corresponding formats cannot be extracted: " + ", ".join(missing)
+        )
+    else:
+        logger.info(
+            "ofrak_unpacker: OFRAK and all checked unpacking dependencies are available."
+        )
