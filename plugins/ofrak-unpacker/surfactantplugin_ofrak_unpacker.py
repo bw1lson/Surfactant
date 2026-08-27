@@ -422,18 +422,52 @@ def _unpack_fs_with_ofrak(filename: str, out_dir: str) -> dict[str, Any]:
                     found.append(descendant)
             return found
 
+        # Shallow unpack first: for a resource that is itself a filesystem (e.g. an
+        # ext partition), a single-level unpack runs its dedicated unpacker and
+        # populates the whole tree quickly, without recursing into every extracted
+        # file. Recursing eagerly is both slow and prone to crashing on a spurious
+        # match inside one of the extracted files, which previously left the
+        # filesystem tagged-but-empty.
         try:
-            await root.unpack_recursively()
-        except Exception as exc:  # noqa: BLE001 - tolerate crashing sub-unpackers
-            logger.warning(f"OFRAK recursive unpack of {filename} hit an error: {exc}")
+            await root.unpack()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"OFRAK shallow unpack of {filename} failed: {exc}")
 
         fs_resources = await _collect_fs_roots()
-        if not fs_resources:
+        have_populated = False
+        for fsr in fs_resources:
             try:
-                await root.unpack()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"OFRAK shallow unpack of {filename} failed: {exc}")
+                if list(await fsr.get_children()):
+                    have_populated = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        # Only dig deeper when the shallow unpack did not already yield a populated
+        # filesystem. This handles wrapper formats (uImage/TRX/etc.) that must be
+        # peeled back a few layers before a filesystem is exposed. A crashing
+        # sub-unpacker here is tolerated.
+        if not have_populated:
+            try:
+                await root.unpack_recursively()
+            except Exception as exc:  # noqa: BLE001 - tolerate crashing sub-unpackers
+                logger.warning(f"OFRAK recursive unpack of {filename} hit an error: {exc}")
             fs_resources = await _collect_fs_roots()
+
+        # A crashing sub-unpacker can abort a recursive pass *after* a filesystem
+        # was identified (tagged) but *before* its dedicated unpacker populated it,
+        # leaving an empty tree. Explicitly unpack any filesystem that still has no
+        # children so its contents are recovered (e.g. ext via debugfs), tolerating
+        # per-resource errors so one bad filesystem can't block the others.
+        for fsr in fs_resources:
+            try:
+                if not list(await fsr.get_children()):
+                    await fsr.unpack()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"OFRAK failed to populate a filesystem in {filename}: {exc}")
+
+        # Re-collect: populating a filesystem may have exposed nested filesystem roots.
+        fs_resources = await _collect_fs_roots()
 
         for idx, fsr in enumerate(fs_resources):
             dest = pathlib.Path(out_dir) / f"filesystem_{idx}"
@@ -473,6 +507,16 @@ def extract_file_info(
     omit_unrecognized_types: bool = False,
 ) -> dict[str, Any] | None:
     supported = supports_file(filetype)
+    if not supported:
+        # ``identify_file_type`` is a ``firstresult=True`` hook, so only the first
+        # plugin to return a non-None result wins and that single label list is
+        # what gets passed here. The built-in magic identifier runs ``tryfirst``
+        # and may win with a label this plugin does not use (e.g. "ZSTANDARD" vs
+        # "ZSTD", "ISO_9660_CD" vs "ISO9660") or return nothing for formats it
+        # doesn't know (e.g. MBR disk images), which would shadow our own
+        # detection. Re-run our own magic-based identification on the file so we
+        # still unpack any format we support, regardless of who won the race.
+        supported = supports_file(identify_file_type(filename))
     if not supported:
         return None
 
