@@ -73,13 +73,10 @@ unpacker tooling. Install the plugin, then OFRAK separately if you want
 extraction:
 
 ```bash
-source /home/setigown/AMPTools/surfactant/.venv/bin/activate
-cd /home/setigown/AMPTools/surfactant/Surfactant/plugins/ofrak-unpacker
-rm -rf build dist *.egg-info
-pip install --no-deps .
-
 # Enable extraction (heavy; may require system tools / Docker image deps):
 pip install ofrak
+# Once installed you must specify the license being used (community or pro)
+ofrak license 
 ```
 
 ## Configuration
