@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "surfactantplugin-binaryninja-info"
 version = "0.1.0"
 authors = [
-    {name = "AMPTools", email = "amptools@example.com"},
+    {name = "Benton Wilson", email = "bwilson@nlr.gov"},
 ]
 description = "Surfactant plugin providing Binary Ninja structural code analysis metadata"
 readme = "README.md"
