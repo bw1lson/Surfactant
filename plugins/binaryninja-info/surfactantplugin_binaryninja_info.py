@@ -2,14 +2,16 @@
 # See the top-level LICENSE file for details.
 #
 # SPDX-License-Identifier: MIT
-"""Surfactant plugin that uses Binary Ninja for structural code analysis.
+"""Surfactant plugin that uses Binary Ninja for control-flow graph extraction.
 
-This plugin is intentionally scoped to the things Binary Ninja does *better* than
-angr: high-fidelity function recovery, the inter-procedural call graph, typed
-function prototypes recovered by the decompiler, and cross-reference (xref) based
-detection of notable/dangerous API usage. It deliberately does **not** duplicate
-the loader/symbol/dependency work owned by the ``angr_expanded`` plugin, so the
-two produce complementary (not overlapping) records on the same binary.
+This plugin is intentionally scoped to the one thing Binary Ninja does *better*
+than angr: high-fidelity function recovery and the per-function control-flow
+graph (basic blocks + edges). To stay lightweight it loads the binary in Binary
+Ninja's ``controlFlow`` analysis mode, which recovers functions and CFGs without
+running the far more expensive data-flow / IL / decompilation passes. It
+deliberately does **not** duplicate the loader/symbol/dependency work owned by
+the ``angr_expanded`` plugin, so the two produce complementary (not overlapping)
+records on the same binary.
 
 The metadata is grouped under the ``binaryNinja`` key on each software entry.
 
@@ -39,9 +41,12 @@ _METADATA_KEY = "binaryNinja"
 # Settings section and keys (read via Surfactant's ConfigManager).
 _SETTINGS_SECTION = "binary_ninja"
 _SETTINGS_CALL_GRAPH = "enable_call_graph"
-_SETTINGS_DECOMPILATION = "enable_decompilation"
-_SETTINGS_FUNCTION_LIST = "enable_function_list"
+_SETTINGS_CONTROL_FLOW_GRAPH = "enable_control_flow_graph"
+_SETTINGS_DATA_FLOW = "enable_data_flow"
+_SETTINGS_ANALYSIS_MODE = "analysis_mode"
 _SETTINGS_MAX_FUNCTIONS = "max_functions"
+_SETTINGS_MIN_BASIC_BLOCKS = "min_basic_blocks"
+_SETTINGS_EXCLUDE_LIBRARY = "exclude_library_functions"
 
 # Cap on how many per-function records are emitted so a single large binary
 # (e.g. a statically-linked busybox with thousands of functions) cannot bloat
@@ -49,51 +54,166 @@ _SETTINGS_MAX_FUNCTIONS = "max_functions"
 # functions regardless of this cap.
 _DEFAULT_MAX_FUNCTIONS = 5000
 
-# Imported functions that are frequently interesting from a security/behavior
-# standpoint. Binary Ninja resolves the code cross-references to each of these,
-# so ``notableApiReferences`` reports *which functions actually call them* rather
-# than merely whether the symbol is present.
-_NOTABLE_APIS = frozenset(
+# Minimum basic-block count for a function to be emitted in the CFG ``functions``
+# list. A single-block function has no control flow worth serializing, and such
+# stubs (PLT thunks, trivial wrappers) otherwise dominate the output. They are
+# still counted in the aggregate stats. Set to 1 to emit every function.
+_DEFAULT_MIN_BASIC_BLOCKS = 2
+
+# GCC/Clang emit helper "clones" — cold-path splits and interprocedural
+# specializations — whose standalone CFG carries little analytic value and which
+# heavily inflate the output. They are excluded from the emitted ``functions``
+# list (still counted in aggregate stats). Matched as substrings of the name.
+_CLONE_MARKERS = (".cold", ".isra", ".constprop", ".part")
+
+# C++ runtime/library namespaces whose functions are rarely the analysis target
+# and which dominate the CFG of any C++ binary. When library exclusion is on
+# (default), functions whose name starts with one of these markers are dropped
+# from the emitted ``functions`` list (still counted in aggregate stats). Both
+# Itanium-mangled prefixes (e.g. ``_ZNSt`` for ``std::``) and demangled
+# ``namespace::`` prefixes are matched so it works regardless of BN's naming.
+_DEFAULT_LIBRARY_MARKERS = (
+    "_ZNSt",  # std:: (nested)
+    "_ZSt",  # std:: (free function)
+    "_ZNKSt",  # std:: (const method)
+    "_ZN9__gnu_cxx",  # __gnu_cxx::
+    "_ZN3fmt",  # fmt::
+    "_ZN6spdlog",  # spdlog::
+    "_ZN7cxxopts",  # cxxopts::
+    "_ZN8nlohmann",  # nlohmann::
+    "std::",
+    "__gnu_cxx::",
+    "fmt::",
+    "spdlog::",
+    "cxxopts::",
+    "nlohmann::",
+)
+
+# How far back the SSA def-use walk will chase an argument's provenance before
+# giving up. Keeps taint tracing bounded on pathological data-flow graphs.
+_MAX_TAINT_DEPTH = 12
+
+# MLIL SSA operations that represent a call/branch-to-callee. Provenance and sink
+# detection only look at these statement-level operations.
+_CALL_OPS = frozenset(
     {
-        "system",
-        "execve",
-        "execl",
-        "execlp",
-        "execvp",
-        "popen",
-        "fork",
-        "socket",
-        "connect",
-        "bind",
-        "listen",
-        "recv",
-        "send",
-        "dlopen",
-        "dlsym",
-        "mmap",
-        "mprotect",
-        "ptrace",
-        "strcpy",
-        "strcat",
-        "sprintf",
-        "gets",
-        "memcpy",
-        "CreateProcessA",
-        "CreateProcessW",
-        "WinExec",
-        "ShellExecuteA",
-        "ShellExecuteW",
-        "LoadLibraryA",
-        "LoadLibraryW",
-        "GetProcAddress",
-        "VirtualAlloc",
-        "VirtualProtect",
-        "WriteProcessMemory",
-        "URLDownloadToFileA",
-        "InternetOpenA",
-        "WSAStartup",
+        "MLIL_CALL_SSA",
+        "MLIL_CALL_UNTYPED_SSA",
+        "MLIL_TAILCALL_SSA",
+        "MLIL_TAILCALL_UNTYPED_SSA",
+        "MLIL_SYSCALL_SSA",
     }
 )
+
+# Dangerous/interesting call targets ("sinks") mapped to a coarse category the
+# downstream POI/exploit-pattern tool can key off of.
+_SINKS: dict[str, str] = {
+    # Unbounded string/memory copies -> buffer overflow surface.
+    "strcpy": "bufferCopy",
+    "stpcpy": "bufferCopy",
+    "strcat": "bufferCopy",
+    "gets": "unboundedInput",
+    "sprintf": "format",
+    "vsprintf": "format",
+    # Bounded variants -> still POIs when the bound is attacker-derived.
+    "strncpy": "boundedCopy",
+    "strncat": "boundedCopy",
+    "snprintf": "boundedFormat",
+    "vsnprintf": "boundedFormat",
+    # Raw memory ops -> overflow when size is dynamic.
+    "memcpy": "memoryCopy",
+    "memmove": "memoryCopy",
+    "bcopy": "memoryCopy",
+    "memset": "memoryWrite",
+    # Format functions -> uncontrolled-format-string surface.
+    "printf": "format",
+    "fprintf": "format",
+    "vprintf": "format",
+    "vfprintf": "format",
+    "syslog": "format",
+    "scanf": "format",
+    "sscanf": "format",
+    "fscanf": "format",
+    # Command / process execution.
+    "system": "commandExec",
+    "popen": "commandExec",
+    "execl": "commandExec",
+    "execlp": "commandExec",
+    "execle": "commandExec",
+    "execv": "commandExec",
+    "execvp": "commandExec",
+    "execvpe": "commandExec",
+    "execve": "commandExec",
+    "CreateProcessA": "commandExec",
+    "CreateProcessW": "commandExec",
+    "WinExec": "commandExec",
+    "ShellExecuteA": "commandExec",
+    "ShellExecuteW": "commandExec",
+    # Allocation -> integer-overflow / heap-overflow surface when size is dynamic.
+    "malloc": "allocation",
+    "calloc": "allocation",
+    "realloc": "allocation",
+    "alloca": "allocation",
+    "valloc": "allocation",
+}
+
+# Untrusted-input producers. When a sink argument's provenance traces back to one
+# of these (or to a function parameter), it is flagged ``attackerControlled``.
+_SOURCES = frozenset(
+    {
+        "recv",
+        "recvfrom",
+        "recvmsg",
+        "read",
+        "pread",
+        "fread",
+        "fgets",
+        "gets",
+        "getline",
+        "getenv",
+        "scanf",
+        "sscanf",
+        "fscanf",
+        "accept",
+        "ReadFile",
+        "InternetReadFile",
+    }
+)
+
+# Argument index carrying the *format string* for each variadic format function.
+# A non-constant value there is an uncontrolled-format-string POI.
+_FORMAT_ARG_INDEX: dict[str, int] = {
+    "printf": 0,
+    "vprintf": 0,
+    "scanf": 0,
+    "fprintf": 1,
+    "vfprintf": 1,
+    "sprintf": 1,
+    "vsprintf": 1,
+    "sscanf": 1,
+    "fscanf": 1,
+    "syslog": 1,
+    "snprintf": 2,
+    "vsnprintf": 2,
+}
+
+# Argument index carrying the *size/length* for copy/alloc sinks. A non-constant
+# value there is an overflow / integer-overflow POI.
+_SIZE_ARG_INDEX: dict[str, int] = {
+    "memcpy": 2,
+    "memmove": 2,
+    "memset": 2,
+    "bcopy": 2,
+    "strncpy": 2,
+    "strncat": 2,
+    "snprintf": 1,
+    "vsnprintf": 1,
+    "malloc": 0,
+    "calloc": 1,
+    "realloc": 1,
+    "alloca": 0,
+    "valloc": 0,
+}
 
 
 def supports_file(filetype: list[str]) -> bool:
@@ -147,6 +267,15 @@ def _get_int_setting(key: str, default: int) -> int:
         return default
 
 
+def _get_str_setting(key: str, default: str) -> str:
+    """Read a string plugin setting, never raising on lookup failure."""
+    try:
+        value = ConfigManager().get(_SETTINGS_SECTION, key, default)
+        return str(value) if value else default
+    except Exception:  # noqa: BLE001 - config lookup must never break extraction
+        return default
+
+
 def _load_binaryninja() -> "bn | None":
     """Import the Binary Ninja API lazily; return the module or None."""
     try:
@@ -160,10 +289,17 @@ def _load_binaryninja() -> "bn | None":
     return bn
 
 
-def _open_view(bn: "bn", path: str) -> "Any | None":
-    """Open a fully-analyzed BinaryView for ``path`` (headless)."""
+def _open_view(bn: "bn", path: str, analysis_mode: str = "controlFlow") -> "Any | None":
+    """Open an analyzed BinaryView for ``path`` (headless) at ``analysis_mode``.
+
+    ``controlFlow`` (default) recovers only functions and basic blocks, which is
+    all the CFG extraction needs. Data-flow / points-of-interest extraction needs
+    MLIL SSA, so it raises the mode (``intermediate`` or ``full``) to run the
+    variable/type and value-set analyses that resolve call arguments and def-use
+    chains. Heavier modes are strictly opt-in.
+    """
     try:
-        view = bn.load(path)
+        view = bn.load(path, options={"analysis.mode": analysis_mode})
     except Exception as e:  # noqa: BLE001 - loading untrusted binaries can raise anything
         logger.info(f"binaryninja_info could not load {path}: {e}")
         return None
@@ -171,7 +307,7 @@ def _open_view(bn: "bn", path: str) -> "Any | None":
         return None
     try:
         # ``load`` normally runs analysis already; this is a cheap no-op if so and
-        # guarantees the call graph / IL are populated before we read them.
+        # guarantees the CFG / IL are populated before we read them.
         view.update_analysis_and_wait()
     except Exception as e:  # noqa: BLE001 - analysis can fail on malformed input
         logger.warning(f"binaryninja_info analysis incomplete for {path}: {e}")
@@ -194,17 +330,46 @@ def _collect_header(bn: "bn", view: "Any") -> dict[str, Any]:
     }
 
 
-def _iter_function_stats(view: "Any", limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Single pass over functions: build a capped inventory + full-corpus stats.
+def _basic_block_record(block: "Any") -> dict[str, Any]:
+    """Build a structure-only record for one basic block (no disassembly text)."""
+    edges: list[dict[str, str]] = []
+    for edge in getattr(block, "outgoing_edges", []):
+        target = getattr(edge, "target", None)
+        if target is None:
+            continue
+        edges.append(
+            {
+                "target": hex(target.start),
+                "type": getattr(edge.type, "name", str(edge.type)),
+            }
+        )
+    return {
+        "start": hex(block.start),
+        "end": hex(block.end),
+        "instructionCount": getattr(block, "instruction_count", 0),
+        "edges": edges,
+    }
 
-    Returns ``(inventory, stats)`` where ``inventory`` is at most ``limit`` compact
-    per-function records and ``stats`` aggregates over *every* recovered function.
+
+def _iter_control_flow(
+    view: "Any", limit: int, min_basic_blocks: int, library_markers: tuple = ()
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Single pass over functions: build a filtered CFG list + full-corpus stats.
+
+    Returns ``(functions, stats)``. ``functions`` holds compact per-function
+    control-flow records (basic blocks + edges), excluding thunks, functions
+    with fewer than ``min_basic_blocks`` blocks (which carry no control flow),
+    compiler-generated clones, and — when ``library_markers`` is non-empty —
+    functions whose name starts with a C++ runtime/library marker. Records are
+    capped at ``limit``. ``stats`` aggregates over *every* recovered function
+    regardless of those filters.
     """
-    inventory: list[dict[str, Any]] = []
+    functions: list[dict[str, Any]] = []
     total_functions = 0
     total_basic_blocks = 0
     total_instructions = 0
     thunk_count = 0
+    capped = False
 
     for func in view.functions:
         total_functions += 1
@@ -220,30 +385,42 @@ def _iter_function_stats(view: "Any", limit: int) -> tuple[list[dict[str, Any]],
         if is_thunk:
             thunk_count += 1
 
-        if len(inventory) < limit:
-            try:
-                param_count = len(func.parameter_vars)
-            except Exception:  # noqa: BLE001 - parameter recovery may be unavailable
-                param_count = 0
-            inventory.append(
-                {
-                    "name": func.name,
-                    "address": hex(func.start),
-                    "basicBlockCount": bb_count,
-                    "instructionCount": insn_count,
-                    "parameterCount": param_count,
-                    "isThunk": is_thunk,
-                }
-            )
+        # Drop analytically-empty or off-target records to cut bloat: thunks
+        # (pure forwarders), compiler-generated clones, functions with no real
+        # control flow, and — when enabled — C++ runtime/library functions. All
+        # are still counted in the aggregate stats above.
+        name = func.name
+        if (
+            is_thunk
+            or bb_count < min_basic_blocks
+            or any(marker in name for marker in _CLONE_MARKERS)
+            or any(name.startswith(prefix) for prefix in library_markers)
+        ):
+            continue
+        if len(functions) >= limit:
+            capped = True
+            continue
+
+        functions.append(
+            {
+                "name": func.name,
+                "address": hex(func.start),
+                "basicBlockCount": bb_count,
+                "instructionCount": insn_count,
+                "isThunk": is_thunk,
+                "basicBlocks": [_basic_block_record(block) for block in basic_blocks],
+            }
+        )
 
     stats = {
         "functionCount": total_functions,
         "basicBlockCount": total_basic_blocks,
         "instructionCount": total_instructions,
         "thunkCount": thunk_count,
-        "inventoryTruncated": total_functions > len(inventory),
+        "emittedFunctionCount": len(functions),
+        "controlFlowTruncated": capped,
     }
-    return inventory, stats
+    return functions, stats
 
 
 def _collect_call_graph(view: "Any") -> dict[str, dict[str, list[str]]]:
@@ -261,50 +438,289 @@ def _collect_call_graph(view: "Any") -> dict[str, dict[str, list[str]]]:
     return graph
 
 
-def _collect_notable_apis(bn: "bn", view: "Any") -> dict[str, list[str]]:
-    """Map each referenced notable API to the functions that call it (via xrefs)."""
-    notable: dict[str, set[str]] = {}
-    symbol_types = []
-    for attr in ("ImportedFunctionSymbol", "ExternalSymbol", "FunctionSymbol"):
-        sym_type = getattr(bn.SymbolType, attr, None)
-        if sym_type is not None:
-            symbol_types.append(sym_type)
-
-    for sym_type in symbol_types:
-        for symbol in view.get_symbols_of_type(sym_type):
-            raw = getattr(symbol, "short_name", None) or symbol.name
-            base = raw.split("@")[0] if raw else raw
-            if base not in _NOTABLE_APIS:
-                continue
-            callers = notable.setdefault(base, set())
-            try:
-                refs = view.get_code_refs(symbol.address)
-            except Exception:  # noqa: BLE001 - address may not be referenceable
-                continue
-            for ref in refs:
-                ref_func = getattr(ref, "function", None)
-                if ref_func is not None:
-                    callers.add(ref_func.name)
-
-    return {api: sorted(callers) for api, callers in sorted(notable.items())}
+# --------------------------------------------------------------------------- #
+# Data-flow / points-of-interest extraction (opt-in, needs MLIL SSA).
+#
+# Binary Ninja has no single "data-flow graph" object: the DFG *is* the SSA
+# def-use chains in the IL. These helpers walk those chains backward from each
+# dangerous call ("sink") argument to classify its provenance and decide whether
+# it is attacker-influenced (traces back to an untrusted source or a function
+# parameter). That reachability signal is what lets a downstream tool narrow a
+# huge call list down to the handful of exploitable points of interest.
+# --------------------------------------------------------------------------- #
 
 
-def _collect_prototypes(view: "Any", limit: int) -> list[dict[str, Any]]:
-    """Collect Binary Ninja's recovered *typed* function prototypes (decompiler).
+def _base_name(name: "str | None") -> "str | None":
+    """Strip ABI/import decorations (``strcpy@plt`` -> ``strcpy``)."""
+    if not name:
+        return name
+    return name.split("@")[0]
 
-    This is the decompilation signal angr does not provide: variable/type recovery
-    surfaced as a C-like prototype per function.
+
+def _callee_name(view: "Any", dest_expr: "Any") -> "str | None":
+    """Resolve a (direct) call target expression to a symbol/function name.
+
+    Returns None for indirect calls (target is not a resolvable constant), which
+    the caller records separately as an indirect-call POI.
     """
-    prototypes: list[dict[str, Any]] = []
-    for func in view.functions:
-        if len(prototypes) >= limit:
-            break
+    if dest_expr is None:
+        return None
+    try:
+        value = dest_expr.value
+        value_type = getattr(getattr(value, "type", None), "name", "")
+        if value_type not in ("ConstantValue", "ConstantPointerValue", "ImportedAddressValue"):
+            return None
+        addr = getattr(value, "value", None)
+        if addr is None:
+            return None
+        symbol = view.get_symbol_at(addr)
+        if symbol is not None:
+            return getattr(symbol, "short_name", None) or symbol.name
+        func = view.get_function_at(addr)
+        if func is not None:
+            return func.name
+    except Exception:  # noqa: BLE001 - value/symbol resolution can raise on odd inputs
+        return None
+    return None
+
+
+def _describe_constant(view: "Any", expr: "Any") -> "tuple[str, str] | None":
+    """If ``expr`` resolves to a constant, return ``(kind, value)`` else None.
+
+    ``kind`` is ``"string"`` when the constant points at readable data, otherwise
+    ``"constant"``. This is the value-set-analysis signal (constant propagation).
+    """
+    try:
+        value = expr.value
+    except Exception:  # noqa: BLE001 - some expressions have no value
+        return None
+    value_type = getattr(getattr(value, "type", None), "name", "")
+    if value_type not in ("ConstantValue", "ConstantPointerValue", "ImportedAddressValue"):
+        return None
+    raw = getattr(value, "value", None)
+    if not isinstance(raw, int):
+        return None
+    try:
+        string_ref = view.get_ascii_string_at(raw, 1)
+    except Exception:  # noqa: BLE001 - address may be unreadable
+        string_ref = None
+    if string_ref is not None:
+        text = getattr(string_ref, "value", None)
+        if text:
+            return ("string", text[:200])
+    return ("constant", hex(raw & 0xFFFFFFFFFFFFFFFF))
+
+
+def _is_parameter(mlil_ssa: "Any", var: "Any") -> bool:
+    """Return True if ``var`` is one of the enclosing function's parameters."""
+    try:
+        params = mlil_ssa.source_function.parameter_vars
+    except Exception:  # noqa: BLE001 - parameter recovery may be unavailable
+        return False
+    try:
+        return any(var == p for p in params)
+    except Exception:  # noqa: BLE001 - Variable comparison can raise on odd types
+        return False
+
+
+def _arg_provenance(
+    view: "Any", mlil_ssa: "Any", expr: "Any", depth: int, seen: set
+) -> dict[str, Any]:
+    """Classify where an argument value comes from via a bounded backward SSA walk.
+
+    Returns ``{"provenance", "value", "tainted", "taintSource"}``. ``tainted`` is
+    True when the value derives from an untrusted source call or a function
+    parameter — i.e. it is (transitively) attacker-influenced.
+    """
+    result: dict[str, Any] = {
+        "provenance": "unknown",
+        "value": None,
+        "tainted": False,
+        "taintSource": None,
+    }
+    if expr is None or depth <= 0:
+        return result
+
+    # 1. Constant / string / global (value-set analysis).
+    described = _describe_constant(view, expr)
+    if described is not None:
+        result["provenance"], result["value"] = described
+        return result
+
+    op = getattr(getattr(expr, "operation", None), "name", "")
+
+    # 2. A variable use: chase its SSA definition.
+    if op in ("MLIL_VAR_SSA", "MLIL_VAR_SSA_FIELD", "MLIL_VAR_ALIASED"):
+        ssa_var = getattr(expr, "src", None)
+        if ssa_var is None:
+            return result
+        key = (
+            getattr(getattr(ssa_var, "var", None), "identifier", id(ssa_var)),
+            getattr(ssa_var, "version", None),
+        )
+        if key in seen:
+            result["provenance"] = "cyclic"
+            return result
+        seen.add(key)
+
         try:
-            prototype = str(func.type)
-        except Exception:  # noqa: BLE001 - type rendering can fail
+            definition = mlil_ssa.get_ssa_var_definition(ssa_var)
+        except Exception:  # noqa: BLE001 - def lookup can fail on partial analysis
+            definition = None
+
+        if definition is None:
+            # No definition in this function => a function input (parameter) or
+            # an uninitialized/global-backed value.
+            var = getattr(ssa_var, "var", None)
+            if var is not None and _is_parameter(mlil_ssa, var):
+                result["provenance"] = "functionParameter"
+                result["tainted"] = True
+                result["taintSource"] = f"param:{getattr(var, 'name', '?')}"
+            else:
+                result["provenance"] = "uninitialized"
+            return result
+
+        def_op = getattr(getattr(definition, "operation", None), "name", "")
+        if def_op in _CALL_OPS:
+            callee = _base_name(_callee_name(view, getattr(definition, "dest", None)))
+            if callee and callee in _SOURCES:
+                result["provenance"] = "sourceOutput"
+                result["tainted"] = True
+                result["taintSource"] = callee
+            else:
+                result["provenance"] = "callResult"
+            return result
+
+        src_expr = getattr(definition, "src", None)
+        if src_expr is not None:
+            return _arg_provenance(view, mlil_ssa, src_expr, depth - 1, seen)
+        result["provenance"] = "defined"
+        return result
+
+    # 3. Pointer dereference: value read from memory (buffer contents).
+    if op in ("MLIL_LOAD_SSA", "MLIL_LOAD"):
+        addr_expr = getattr(expr, "src", None)
+        sub = _arg_provenance(view, mlil_ssa, addr_expr, depth - 1, seen)
+        result["provenance"] = "memoryLoad"
+        result["tainted"] = sub["tainted"]
+        result["taintSource"] = sub["taintSource"]
+        return result
+
+    # 4. Arithmetic / composite: propagate taint from any operand.
+    operands = getattr(expr, "operands", None) or []
+    tainted = False
+    taint_source = None
+    for sub_expr in operands:
+        if not hasattr(sub_expr, "operation"):
             continue
-        prototypes.append({"name": func.name, "prototype": prototype})
-    return prototypes
+        sub = _arg_provenance(view, mlil_ssa, sub_expr, depth - 1, seen)
+        if sub["tainted"]:
+            tainted = True
+            taint_source = taint_source or sub["taintSource"]
+    result["provenance"] = "computed"
+    result["tainted"] = tainted
+    result["taintSource"] = taint_source
+    return result
+
+
+def _collect_points_of_interest(view: "Any", limit: int) -> dict[str, Any]:
+    """Extract sink/source/indirect/format POIs with data-flow taint reachability.
+
+    Walks MLIL SSA per function (up to ``limit`` functions), locating calls to
+    known sinks, classifying each argument's provenance through the SSA def-use
+    graph, and flagging arguments that are (transitively) attacker-controlled.
+    """
+    sink_sites: list[dict[str, Any]] = []
+    source_sites: list[dict[str, Any]] = []
+    indirect_calls: list[dict[str, Any]] = []
+    format_pois: list[dict[str, Any]] = []
+    analyzed = 0
+    truncated = False
+
+    for func in view.functions:
+        if analyzed >= limit:
+            truncated = True
+            break
+        mlil = getattr(func, "mlil", None)
+        if mlil is None:
+            continue
+        try:
+            mlil_ssa = mlil.ssa_form
+        except Exception:  # noqa: BLE001 - SSA form may be unavailable
+            mlil_ssa = None
+        if mlil_ssa is None:
+            continue
+        analyzed += 1
+
+        for insn in mlil_ssa.instructions:
+            op = getattr(getattr(insn, "operation", None), "name", "")
+            if op not in _CALL_OPS:
+                continue
+            addr = hex(getattr(insn, "address", func.start))
+            callee = _base_name(_callee_name(view, getattr(insn, "dest", None)))
+
+            if callee is None:
+                if "SYSCALL" not in op:
+                    indirect_calls.append({"callSite": addr, "function": func.name})
+                continue
+
+            if callee in _SOURCES:
+                source_sites.append(
+                    {"callSite": addr, "function": func.name, "callee": callee}
+                )
+
+            category = _SINKS.get(callee)
+            if category is None:
+                continue
+
+            params = list(getattr(insn, "params", None) or [])
+            arg_records: list[dict[str, Any]] = []
+            attacker_controlled = False
+            for idx, param in enumerate(params[:8]):
+                prov = _arg_provenance(view, mlil_ssa, param, _MAX_TAINT_DEPTH, set())
+                arg_records.append({"index": idx, **prov})
+                attacker_controlled = attacker_controlled or prov["tainted"]
+
+            record: dict[str, Any] = {
+                "callSite": addr,
+                "function": func.name,
+                "callee": callee,
+                "category": category,
+                "attackerControlled": attacker_controlled,
+                "arguments": arg_records,
+            }
+
+            size_idx = _SIZE_ARG_INDEX.get(callee)
+            if size_idx is not None and size_idx < len(arg_records):
+                size_arg = arg_records[size_idx]
+                record["dynamicSize"] = size_arg["provenance"] != "constant"
+
+            sink_sites.append(record)
+
+            fmt_idx = _FORMAT_ARG_INDEX.get(callee)
+            if fmt_idx is not None and fmt_idx < len(arg_records):
+                fmt_arg = arg_records[fmt_idx]
+                if fmt_arg["provenance"] not in ("string", "constant"):
+                    format_pois.append(
+                        {
+                            "callSite": addr,
+                            "function": func.name,
+                            "callee": callee,
+                            "formatArgProvenance": fmt_arg["provenance"],
+                            "attackerControlled": fmt_arg["tainted"],
+                        }
+                    )
+
+    return {
+        "sinkCallSites": sink_sites,
+        "sourceCallSites": source_sites,
+        "indirectCalls": indirect_calls,
+        "uncontrolledFormatStrings": format_pois,
+        "attackerControlledSinkCount": sum(
+            1 for s in sink_sites if s["attackerControlled"]
+        ),
+        "pointsOfInterestTruncated": truncated,
+    }
 
 
 @surfactant.plugin.hookimpl(specname="extract_file_info")
@@ -342,25 +758,39 @@ def binaryninja_info(
     if bn is None:
         return None
 
-    view = _open_view(bn, path.as_posix())
+    # Data-flow / POI extraction needs MLIL SSA, so it forces a heavier analysis
+    # mode. CFG-only extraction stays on the cheap ``controlFlow`` mode. An
+    # explicit ``analysis_mode`` setting overrides the auto-selected default.
+    data_flow_enabled = _get_bool_setting(_SETTINGS_DATA_FLOW, False)
+    default_mode = "full" if data_flow_enabled else "controlFlow"
+    analysis_mode = _get_str_setting(_SETTINGS_ANALYSIS_MODE, default_mode)
+
+    view = _open_view(bn, path.as_posix(), analysis_mode)
     if view is None:
         return None
 
     max_functions = _get_int_setting(_SETTINGS_MAX_FUNCTIONS, _DEFAULT_MAX_FUNCTIONS)
+    min_basic_blocks = _get_int_setting(_SETTINGS_MIN_BASIC_BLOCKS, _DEFAULT_MIN_BASIC_BLOCKS)
+    library_markers = (
+        _DEFAULT_LIBRARY_MARKERS
+        if _get_bool_setting(_SETTINGS_EXCLUDE_LIBRARY, True)
+        else ()
+    )
     metadata: dict[str, Any] = {}
     try:
         metadata.update(_collect_header(bn, view))
 
-        inventory, stats = _iter_function_stats(view, max_functions)
+        functions, stats = _iter_control_flow(
+            view, max_functions, min_basic_blocks, library_markers
+        )
         metadata.update(stats)
-        metadata["notableApiReferences"] = _collect_notable_apis(bn, view)
 
-        if _get_bool_setting(_SETTINGS_FUNCTION_LIST, True):
-            metadata["functions"] = inventory
+        if _get_bool_setting(_SETTINGS_CONTROL_FLOW_GRAPH, True):
+            metadata["functions"] = functions
         if _get_bool_setting(_SETTINGS_CALL_GRAPH, False):
             metadata["callGraph"] = _collect_call_graph(view)
-        if _get_bool_setting(_SETTINGS_DECOMPILATION, False):
-            metadata["functionPrototypes"] = _collect_prototypes(view, max_functions)
+        if data_flow_enabled:
+            metadata["pointsOfInterest"] = _collect_points_of_interest(view, max_functions)
     except Exception as e:  # noqa: BLE001 - keep SBOM generation resilient
         logger.warning(f"binaryninja_info partial extraction for {filename}: {e}")
     finally:
