@@ -6,7 +6,7 @@ Surfactant natively decompresses common archives (ZIP/TAR/GZIP/BZIP2/XZ/RAR) via
 ``file_decompression.py``. This plugin extends that idea to firmware and embedded
 container formats that OFRAK knows how to unpack (SquashFS, CramFS, JFFS2, UBI/UBIFS,
 ext filesystems, U-Boot uImage, OpenWrt TRX, 7-Zip, ISO 9660, UEFI firmware volumes,
-UF2, CPIO, device tree blobs, zstd/lz4/lzop streams, etc.).
+UF2, CPIO, zstd/lzop streams, etc.).
 
 It works exactly like the built-in decompressor: it unpacks the container to a
 temporary directory and pushes ``ContextEntry`` objects onto Surfactant's
@@ -21,10 +21,13 @@ warning and skips unpacking.
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import importlib.util
 import pathlib
 import shutil
 import tempfile
+import threading
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -48,6 +51,8 @@ if TYPE_CHECKING:
 #
 # ROMFS and Android boot images were intentionally dropped: OFRAK's core has no
 # unpacker for them, so identifying them here only produced empty extractions.
+# Device tree blobs (DTB) were also dropped: they describe hardware, contain no
+# software artifacts for the SBOM, and OFRAK's DtbUnpacker crashes on some of them.
 _MAGIC_SIGNATURES: dict[str, tuple[int, tuple[bytes, ...]]] = {
     # SquashFS: "hsqs" (little-endian) or "sqsh" (big-endian) at offset 0
     "SQUASHFS": (0, (b"hsqs", b"sqsh")),
@@ -62,8 +67,6 @@ _MAGIC_SIGNATURES: dict[str, tuple[int, tuple[bytes, ...]]] = {
     "UIMAGE": (0, (b"\x27\x05\x19\x56",)),
     # OpenWrt TRX firmware: magic "HDR0" (0x30524448 little-endian) at offset 0
     "OPENWRT_TRX": (0, (b"HDR0",)),
-    # Device tree blob (FDT): 0xd00dfeed at offset 0
-    "DTB": (0, (b"\xd0\x0d\xfe\xed",)),
     # CPIO archives (newc/crc ASCII and old binary)
     "CPIO": (0, (b"070701", b"070702", b"070707", b"\xc7\x71")),
     # YAFFS2 object header (first record is typically a directory named for the root)
@@ -337,6 +340,73 @@ def _ofrak_available() -> bool:
     return True
 
 
+class _OfrakSession:
+    """A single long-lived OFRAK context shared across every file in a run.
+
+    Building an OFRAK context (service discovery, license verification, component
+    registration) takes several seconds. The plugin previously paid that cost
+    once *per file* via ``ofrak.OFRAK().run()``, which dominated runtime on
+    firmware images that expand into thousands of extractable containers.
+
+    This session starts one context on a dedicated background event loop and
+    reuses it for every unpack. Access is serialized with a lock because a single
+    OFRAK context (and its asyncio loop) is not safe to drive concurrently, and
+    OFRAK itself only allows one live context per process.
+    """
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._context: Any = None
+        self._lock = threading.Lock()
+
+    def _ensure_started(self) -> None:
+        if self._context is not None:
+            return
+        import ofrak  # local import so the plugin loads without OFRAK installed
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, name="ofrak-session", daemon=True)
+        thread.start()
+        future = asyncio.run_coroutine_threadsafe(
+            ofrak.OFRAK().create_ofrak_context(), loop
+        )
+        self._context = future.result()
+        self._loop = loop
+        self._thread = thread
+        atexit.register(self.shutdown)
+
+    def run(self, coro_factory: Any) -> Any:
+        """Run ``coro_factory(context)`` on the shared context and return its result."""
+        with self._lock:
+            self._ensure_started()
+            future = asyncio.run_coroutine_threadsafe(
+                coro_factory(self._context), self._loop
+            )
+            return future.result()
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if self._context is None:
+                return
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._context.shutdown_context(), self._loop
+                )
+                future.result(timeout=30)
+            except Exception:  # noqa: BLE001
+                pass
+            self._context = None
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                self._loop = None
+            self._thread = None
+
+
+# Module-level singleton so every ``extract_file_info`` call reuses one context.
+_OFRAK_SESSION = _OfrakSession()
+
+
 async def _mapped_coverage(root_resource: Any) -> tuple[int, float] | None:
     """Return ``(image_size, covered_fraction)`` for an unpacked OFRAK resource.
 
@@ -405,94 +475,108 @@ def _unpack_fs_with_ofrak(filename: str, out_dir: str) -> dict[str, Any]:
     errors are tolerated: whatever filesystem trees were recovered are still
     flushed to disk, and a single-level unpack is used as a fallback.
     """
-    import ofrak  # local import so the plugin loads without OFRAK installed
     from ofrak.core.filesystem import FilesystemRoot
 
     summary: dict[str, Any] = {"extractedFileCount": 0, "filesystemCount": 0}
 
-    async def _run(ofrak_context: "ofrak.OFRAKContext") -> None:
+    async def _run(ofrak_context: Any) -> None:
         root = await ofrak_context.create_root_resource_from_file(filename)
-
-        async def _collect_fs_roots() -> list[Any]:
-            found: list[Any] = []
-            if root.has_tag(FilesystemRoot):
-                found.append(root)
-            for descendant in await root.get_descendants():
-                if descendant.has_tag(FilesystemRoot):
-                    found.append(descendant)
-            return found
-
-        # Shallow unpack first: for a resource that is itself a filesystem (e.g. an
-        # ext partition), a single-level unpack runs its dedicated unpacker and
-        # populates the whole tree quickly, without recursing into every extracted
-        # file. Recursing eagerly is both slow and prone to crashing on a spurious
-        # match inside one of the extracted files, which previously left the
-        # filesystem tagged-but-empty.
         try:
-            await root.unpack()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"OFRAK shallow unpack of {filename} failed: {exc}")
+            async def _collect_fs_roots() -> list[Any]:
+                found: list[Any] = []
+                if root.has_tag(FilesystemRoot):
+                    found.append(root)
+                for descendant in await root.get_descendants():
+                    if descendant.has_tag(FilesystemRoot):
+                        found.append(descendant)
+                return found
 
-        fs_resources = await _collect_fs_roots()
-        have_populated = False
-        for fsr in fs_resources:
+            # Shallow unpack first: for a resource that is itself a filesystem (e.g. an
+            # ext partition), a single-level unpack runs its dedicated unpacker and
+            # populates the whole tree quickly, without recursing into every extracted
+            # file. Recursing eagerly is both slow and prone to crashing on a spurious
+            # match inside one of the extracted files, which previously left the
+            # filesystem tagged-but-empty.
             try:
-                if list(await fsr.get_children()):
-                    have_populated = True
-                    break
-            except Exception:  # noqa: BLE001
-                continue
+                await root.unpack()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"OFRAK shallow unpack of {filename} failed: {exc}")
 
-        # Only dig deeper when the shallow unpack did not already yield a populated
-        # filesystem. This handles wrapper formats (uImage/TRX/etc.) that must be
-        # peeled back a few layers before a filesystem is exposed. A crashing
-        # sub-unpacker here is tolerated.
-        if not have_populated:
-            try:
-                await root.unpack_recursively()
-            except Exception as exc:  # noqa: BLE001 - tolerate crashing sub-unpackers
-                logger.warning(f"OFRAK recursive unpack of {filename} hit an error: {exc}")
+            fs_resources = await _collect_fs_roots()
+            have_populated = False
+            for fsr in fs_resources:
+                try:
+                    if list(await fsr.get_children()):
+                        have_populated = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+            # Only dig deeper when the shallow unpack did not already yield a populated
+            # filesystem. This handles wrapper formats (uImage/TRX/etc.) that must be
+            # peeled back a few layers before a filesystem is exposed. A crashing
+            # sub-unpacker here is tolerated.
+            if not have_populated:
+                try:
+                    await root.unpack_recursively()
+                except Exception as exc:  # noqa: BLE001 - tolerate crashing sub-unpackers
+                    logger.warning(
+                        f"OFRAK recursive unpack of {filename} hit an error: {exc}"
+                    )
+                fs_resources = await _collect_fs_roots()
+
+            # A crashing sub-unpacker can abort a recursive pass *after* a filesystem
+            # was identified (tagged) but *before* its dedicated unpacker populated it,
+            # leaving an empty tree. Explicitly unpack any filesystem that still has no
+            # children so its contents are recovered (e.g. ext via debugfs), tolerating
+            # per-resource errors so one bad filesystem can't block the others.
+            for fsr in fs_resources:
+                try:
+                    if not list(await fsr.get_children()):
+                        await fsr.unpack()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"OFRAK failed to populate a filesystem in {filename}: {exc}"
+                    )
+
+            # Re-collect: populating a filesystem may have exposed nested filesystem roots.
             fs_resources = await _collect_fs_roots()
 
-        # A crashing sub-unpacker can abort a recursive pass *after* a filesystem
-        # was identified (tagged) but *before* its dedicated unpacker populated it,
-        # leaving an empty tree. Explicitly unpack any filesystem that still has no
-        # children so its contents are recovered (e.g. ext via debugfs), tolerating
-        # per-resource errors so one bad filesystem can't block the others.
-        for fsr in fs_resources:
+            for idx, fsr in enumerate(fs_resources):
+                dest = pathlib.Path(out_dir) / f"filesystem_{idx}"
+                dest.mkdir(parents=True, exist_ok=True)
+                try:
+                    view = await fsr.view_as(FilesystemRoot)
+                    await view.flush_to_disk(str(dest))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"OFRAK failed to flush filesystem_{idx} of {filename}: {exc}"
+                    )
+
+            summary["filesystemCount"] = len(fs_resources)
+            summary["extractedFileCount"] = sum(
+                1 for p in pathlib.Path(out_dir).rglob("*") if p.is_file()
+            )
+
+            coverage = await _mapped_coverage(root)
+            if coverage is not None:
+                image_size, fraction = coverage
+                summary["imageSize"] = image_size
+                summary["coveragePercent"] = round(fraction * 100, 2)
+        finally:
+            # The OFRAK context is shared across every file in the run, so the
+            # resource tree for this file must be released once it has been
+            # flushed to disk; otherwise the whole firmware image's worth of
+            # unpacked filesystems would pile up in memory.
             try:
-                if not list(await fsr.get_children()):
-                    await fsr.unpack()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"OFRAK failed to populate a filesystem in {filename}: {exc}")
+                await root.delete()
+                await root.save()
+            except Exception:  # noqa: BLE001
+                pass
 
-        # Re-collect: populating a filesystem may have exposed nested filesystem roots.
-        fs_resources = await _collect_fs_roots()
-
-        for idx, fsr in enumerate(fs_resources):
-            dest = pathlib.Path(out_dir) / f"filesystem_{idx}"
-            dest.mkdir(parents=True, exist_ok=True)
-            try:
-                view = await fsr.view_as(FilesystemRoot)
-                await view.flush_to_disk(str(dest))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    f"OFRAK failed to flush filesystem_{idx} of {filename}: {exc}"
-                )
-
-        summary["filesystemCount"] = len(fs_resources)
-        summary["extractedFileCount"] = sum(
-            1 for p in pathlib.Path(out_dir).rglob("*") if p.is_file()
-        )
-
-        coverage = await _mapped_coverage(root)
-        if coverage is not None:
-            image_size, fraction = coverage
-            summary["imageSize"] = image_size
-            summary["coveragePercent"] = round(fraction * 100, 2)
-
-    ofrak.OFRAK().run(_run)
+    _OFRAK_SESSION.run(_run)
     return summary
+
 
 
 # pylint: disable=too-many-positional-arguments
