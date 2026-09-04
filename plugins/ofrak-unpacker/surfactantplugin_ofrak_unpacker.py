@@ -40,6 +40,11 @@ if TYPE_CHECKING:
 
     from surfactant.sbomtypes import SBOM, Software
 
+# ``except Exception`` guards and the lazy ``ofrak`` imports below are intentional:
+# OFRAK is an optional dependency and unpacking untrusted firmware must never abort
+# SBOM generation for the rest of the corpus.
+# pylint: disable=broad-exception-caught,import-outside-toplevel
+
 # ---------------------------------------------------------------------------
 # File-type identification (magic bytes)
 # ---------------------------------------------------------------------------
@@ -331,11 +336,7 @@ def identify_file_type(filepath: str, context: ContextEntry | None = None) -> li
 
 
 def _ofrak_available() -> bool:
-    try:
-        import ofrak  # noqa: F401, PLC0415 - optional dependency probed lazily
-    except ImportError:
-        return False
-    return True
+    return importlib.util.find_spec("ofrak") is not None
 
 
 class _OfrakSession:
@@ -567,7 +568,7 @@ def _unpack_fs_with_ofrak(filename: str, out_dir: str) -> dict[str, Any]:
     return summary
 
 
-# pylint: disable=too-many-positional-arguments
+# pylint: disable=too-many-positional-arguments,too-many-return-statements
 @surfactant.plugin.hookimpl
 def extract_file_info(
     sbom: SBOM,

@@ -36,6 +36,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime h
 
     from surfactant.sbomtypes import SBOM, Software
 
+# ``except Exception`` guards and the lazy Binary Ninja import below are intentional:
+# a missing/unlicensed install or a malformed binary must never abort SBOM generation.
+# pylint: disable=broad-exception-caught,import-outside-toplevel
+
 # Top-level key the metadata object is stored under in the software entry.
 _METADATA_KEY = "binaryNinja"
 
@@ -297,6 +301,7 @@ def binaryninja_info(sbom: SBOM, software: Software, filename: str, filetype: li
         object: A metadata dict stored under ``binaryNinja``, or None if the file
             is unsupported or Binary Ninja could not analyze it.
     """
+    # pylint: disable=too-many-return-statements
     if not supports_file(filetype):
         return None
 

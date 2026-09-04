@@ -37,7 +37,6 @@ from loguru import logger
 import surfactant.plugin
 from surfactant import ContextEntry
 from surfactant.configmanager import ConfigManager
-from surfactant.sbomtypes import Software
 
 if TYPE_CHECKING:
     from queue import Queue
@@ -247,7 +246,7 @@ def _existing_carved_files(out_dir: str) -> list[str]:
     return [str(p) for p in sorted(pathlib.Path(out_dir).glob("carved_*")) if p.is_file()]
 
 
-# pylint: disable-next=too-many-positional-arguments
+# pylint: disable=too-many-positional-arguments
 @surfactant.plugin.hookimpl
 def extract_file_info(
     software: Software,
@@ -258,6 +257,7 @@ def extract_file_info(
     omit_unrecognized_types: bool = False,
 ) -> dict[str, Any] | None:
     """Carve non-zero-offset embedded regions out of ``filename`` and queue them."""
+    # pylint: disable=too-many-return-statements
     if _binwalk_path() is None:
         return None
 

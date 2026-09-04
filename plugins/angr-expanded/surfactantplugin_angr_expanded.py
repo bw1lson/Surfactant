@@ -30,6 +30,10 @@ from loguru import logger
 import surfactant.plugin
 from surfactant.sbomtypes import SBOM, Relationship, Software
 
+# Every ``except Exception`` below is intentional: analyzing a possibly-malformed or
+# untrusted binary must never abort SBOM generation for the rest of the corpus.
+# pylint: disable=broad-exception-caught
+
 # Top-level key the metadata object is stored under in the software entry.
 _METADATA_KEY = "angrExpanded"
 
@@ -375,7 +379,7 @@ def establish_relationships(
                 exporter = exporter or next(
                     (s for s in (sbom.software or []) if s.UUID == exporter_uuid), None
                 )
-                if exporter is not None and not (_basenames(exporter.fileName) & linked_libs):
+                if exporter is not None and not _basenames(exporter.fileName) & linked_libs:
                     continue
             matches.setdefault(exporter_uuid, set()).add(name)
 
