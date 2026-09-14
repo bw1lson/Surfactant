@@ -2,13 +2,18 @@
 # See the top-level LICENSE file for details.
 #
 # SPDX-License-Identifier: MIT
-"""Surfactant plugin that uses Binary Ninja for control-flow graph extraction.
+"""Surfactant plugin that uses Binary Ninja for CFG and POI extraction.
 
-This plugin is intentionally scoped to the one thing Binary Ninja does *better*
-than angr: high-fidelity function recovery and the per-function control-flow
-graph (basic blocks + edges). It loads the binary in Binary Ninja's
-``controlFlow`` analysis mode, which recovers functions and CFGs without running
-the far more expensive data-flow / IL / decompilation passes.
+This plugin supports two output profiles:
+
+* ``full_cfg``: high-fidelity function recovery and per-function control-flow
+    graph (basic blocks + edges).
+* ``poi_fast``: compact, score-ranked points-of-interest (POI) for fast triage
+    and downstream deep analysis.
+
+Both profiles load the binary in Binary Ninja's ``controlFlow`` analysis mode,
+which recovers functions and CFGs without running the far more expensive
+data-flow / IL / decompilation passes.
 
 It deliberately does **not** duplicate the loader/symbol/dependency work owned by
 the ``angr_expanded`` plugin, so the two produce complementary (not overlapping)
@@ -25,6 +30,7 @@ from __future__ import annotations
 import contextlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+import math
 
 from loguru import logger
 
@@ -48,6 +54,10 @@ _SETTINGS_SECTION = "binary_ninja"
 _SETTINGS_MAX_FUNCTIONS = "max_functions"
 _SETTINGS_MIN_BASIC_BLOCKS = "min_basic_blocks"
 _SETTINGS_EXCLUDE_LIBRARY = "exclude_library_functions"
+_SETTINGS_OUTPUT_PROFILE = "output_profile"
+_SETTINGS_POI_COUNT = "poi_count"
+_SETTINGS_POI_MIN_SCORE = "poi_min_score"
+_SETTINGS_POI_KEYWORDS = "poi_keywords"
 
 # Cap on how many per-function records are emitted so a single large binary
 # (e.g. a statically-linked busybox with thousands of functions) cannot bloat
@@ -60,6 +70,79 @@ _DEFAULT_MAX_FUNCTIONS = 5000
 # stubs (PLT thunks, trivial wrappers) otherwise dominate the output. They are
 # still counted in the aggregate stats. Set to 1 to emit every function.
 _DEFAULT_MIN_BASIC_BLOCKS = 2
+_DEFAULT_OUTPUT_PROFILE = "poi_fast"
+_DEFAULT_POI_COUNT = 50
+_DEFAULT_POI_MIN_SCORE = 1.0
+_DEFAULT_POI_KEYWORDS = (
+    "auth",
+    "login",
+    "passwd",
+    "password",
+    "credential",
+    "admin",
+    "priv",
+    "token",
+    "cert",
+    "x509",
+    "crypto",
+    "key",
+    "hmac",
+    "encrypt",
+    "decrypt",
+    "tls",
+    "ssl",
+    "verify",
+    "signature",
+    "update",
+    "upgrade",
+    "firmware",
+    "ota",
+    "flash",
+    "boot",
+    "crc",
+    "sha",
+    "md5",
+    "dnp3",
+    "modbus",
+    "iec104",
+    "iec61850",
+    "opcua",
+    "profinet",
+    "ethernetip",
+    "cip",
+    "bacnet",
+    "mqtt",
+    "snmp",
+    "socket",
+    "bind",
+    "listen",
+    "accept",
+    "connect",
+    "recv",
+    "send",
+    "http",
+    "https",
+    "telnet",
+    "ssh",
+    "ftp",
+    "tftp",
+    "packet",
+    "parse",
+    "decode",
+    "command",
+    "shell",
+    "exec",
+    "setpoint",
+    "interlock",
+    "trip",
+    "alarm",
+    "watchdog",
+    "valve",
+    "pump",
+    "motor",
+    "relay",
+    "breaker",
+)
 
 # GCC/Clang emit helper "clones" — cold-path splits and interprocedural
 # specializations — whose standalone CFG carries little analytic value and which
@@ -138,6 +221,24 @@ def _get_int_setting(key: str, default: int) -> int:
     try:
         value = ConfigManager().get(_SETTINGS_SECTION, key, default)
         return int(value)
+    except Exception:  # noqa: BLE001 - config lookup must never break extraction
+        return default
+
+
+def _get_str_setting(key: str, default: str) -> str:
+    """Read a string plugin setting, never raising on lookup failure."""
+    try:
+        value = ConfigManager().get(_SETTINGS_SECTION, key, default)
+        return str(value)
+    except Exception:  # noqa: BLE001 - config lookup must never break extraction
+        return default
+
+
+def _get_float_setting(key: str, default: float) -> float:
+    """Read a float plugin setting, never raising on lookup failure."""
+    try:
+        value = ConfigManager().get(_SETTINGS_SECTION, key, default)
+        return float(value)
     except Exception:  # noqa: BLE001 - config lookup must never break extraction
         return default
 
@@ -287,6 +388,174 @@ def _iter_control_flow(
     return functions, stats
 
 
+def _parse_keywords(value: str | None) -> tuple[str, ...]:
+    """Parse comma-separated POI keywords with sane defaults."""
+    if not value:
+        return _DEFAULT_POI_KEYWORDS
+    keywords = tuple(k.strip().lower() for k in value.split(",") if k.strip())
+    return keywords or _DEFAULT_POI_KEYWORDS
+
+
+def _safe_len(value: Any) -> int:
+    """Best-effort len() for optional BN collections."""
+    with contextlib.suppress(Exception):
+        return len(value)
+    return 0
+
+
+def _score_function(
+    name: str,
+    bb_count: int,
+    insn_count: int,
+    edge_count: int,
+    caller_count: int,
+    callee_count: int,
+    keywords: tuple[str, ...],
+) -> tuple[float, list[str]]:
+    """Compute a lightweight POI score and explainable reason tags."""
+    reasons: list[str] = []
+    score = 0.0
+
+    # Size and complexity are broad indicators of semantic density.
+    size_score = min(4.0, math.log2(max(insn_count, 1)) / 3.0)
+    bb_score = min(3.0, math.log2(max(bb_count, 1)) / 2.0)
+    score += size_score + bb_score
+
+    if insn_count >= 300:
+        reasons.append("large_instruction_footprint")
+    if bb_count >= 30:
+        reasons.append("high_basic_block_count")
+
+    # Branchy functions are frequently dispatchers/parsers/state machines.
+    if edge_count >= 20:
+        score += 1.5
+        reasons.append("branch_dense_cfg")
+    elif edge_count >= 10:
+        score += 0.75
+
+    # Call-graph centrality hints.
+    if caller_count >= 10:
+        score += 1.2
+        reasons.append("many_callers")
+    elif caller_count >= 5:
+        score += 0.6
+
+    if callee_count >= 10:
+        score += 1.0
+        reasons.append("many_callees")
+    elif callee_count >= 5:
+        score += 0.5
+
+    # Cheap semantic hints from symbol names.
+    lname = name.lower()
+    keyword_hits = [kw for kw in keywords if kw in lname]
+    if keyword_hits:
+        score += min(2.0, 0.8 + 0.3 * len(keyword_hits))
+        reasons.append(f"keyword_match:{'|'.join(keyword_hits[:4])}")
+
+    # Penalize tiny leaf-like wrappers.
+    if insn_count <= 12 and bb_count <= 2 and callee_count <= 1 and caller_count <= 2:
+        score -= 1.5
+        reasons.append("tiny_wrapper_like")
+
+    return round(score, 3), reasons
+
+
+def _iter_poi_candidates(
+    view: Any,
+    limit: int,
+    min_score: float,
+    min_basic_blocks: int,
+    library_markers: tuple[str, ...],
+    keywords: tuple[str, ...],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build compact ranked POI candidates plus full-corpus aggregate stats."""
+    candidates: list[dict[str, Any]] = []
+    total_functions = 0
+    total_basic_blocks = 0
+    total_instructions = 0
+    thunk_count = 0
+
+    for func in view.functions:
+        total_functions += 1
+        basic_blocks = func.basic_blocks
+        bb_count = len(basic_blocks)
+        insn_count = 0
+        edge_count = 0
+        for block in basic_blocks:
+            insn_count += getattr(block, "instruction_count", 0)
+            edge_count += _safe_len(getattr(block, "outgoing_edges", []))
+
+        total_basic_blocks += bb_count
+        total_instructions += insn_count
+
+        is_thunk = bool(getattr(func, "is_thunk", False))
+        if is_thunk:
+            thunk_count += 1
+
+        name = func.name
+        if (
+            is_thunk
+            or bb_count < min_basic_blocks
+            or any(marker in name for marker in _CLONE_MARKERS)
+            or any(name.startswith(prefix) for prefix in library_markers)
+        ):
+            continue
+
+        caller_count = _safe_len(getattr(func, "callers", []))
+        callee_count = _safe_len(getattr(func, "callees", []))
+        score, reasons = _score_function(
+            name,
+            bb_count,
+            insn_count,
+            edge_count,
+            caller_count,
+            callee_count,
+            keywords,
+        )
+        if score < min_score:
+            continue
+
+        candidates.append(
+            {
+                "name": name,
+                "address": hex(func.start),
+                "score": score,
+                "reasons": reasons,
+                "metrics": {
+                    "instructionCount": insn_count,
+                    "basicBlockCount": bb_count,
+                    "outgoingEdgeCount": edge_count,
+                    "callerCount": caller_count,
+                    "calleeCount": callee_count,
+                },
+            }
+        )
+
+    candidates.sort(
+        key=lambda c: (
+            c["score"],
+            c["metrics"]["instructionCount"],
+            c["metrics"]["basicBlockCount"],
+        ),
+        reverse=True,
+    )
+    capped = len(candidates) > limit
+    emitted = candidates[:limit]
+
+    stats = {
+        "functionCount": total_functions,
+        "basicBlockCount": total_basic_blocks,
+        "instructionCount": total_instructions,
+        "thunkCount": thunk_count,
+        "emittedFunctionCount": len(emitted),
+        "controlFlowTruncated": capped,
+        "poiScoringVersion": "1",
+        "poiCandidateCount": len(candidates),
+    }
+    return emitted, stats
+
+
 @surfactant.plugin.hookimpl(specname="extract_file_info")
 def binaryninja_info(sbom: SBOM, software: Software, filename: str, filetype: list[str]) -> object:
     """Extract Binary Ninja control-flow-graph metadata for the SBOM.
@@ -325,19 +594,45 @@ def binaryninja_info(sbom: SBOM, software: Software, filename: str, filetype: li
     if view is None:
         return None
 
+    profile = _get_str_setting(_SETTINGS_OUTPUT_PROFILE, _DEFAULT_OUTPUT_PROFILE).strip().lower()
+    if profile not in {"full_cfg", "poi_fast"}:
+        logger.warning(
+            f"binaryninja_info: unknown output_profile '{profile}'; "
+            f"using {_DEFAULT_OUTPUT_PROFILE}"
+        )
+        profile = _DEFAULT_OUTPUT_PROFILE
+
     max_functions = _get_int_setting(_SETTINGS_MAX_FUNCTIONS, _DEFAULT_MAX_FUNCTIONS)
     min_basic_blocks = _get_int_setting(_SETTINGS_MIN_BASIC_BLOCKS, _DEFAULT_MIN_BASIC_BLOCKS)
     library_markers = (
         _DEFAULT_LIBRARY_MARKERS if _get_bool_setting(_SETTINGS_EXCLUDE_LIBRARY, True) else ()
     )
+    poi_count = _get_int_setting(_SETTINGS_POI_COUNT, _DEFAULT_POI_COUNT)
+    poi_count = max(1, poi_count)
+    poi_min_score = _get_float_setting(_SETTINGS_POI_MIN_SCORE, _DEFAULT_POI_MIN_SCORE)
+    poi_keywords = _parse_keywords(_get_str_setting(_SETTINGS_POI_KEYWORDS, ""))
+
     metadata: dict[str, Any] = {}
     try:
         metadata.update(_collect_header(bn, view))
-        functions, stats = _iter_control_flow(
-            view, max_functions, min_basic_blocks, library_markers
-        )
-        metadata.update(stats)
-        metadata["functions"] = functions
+        metadata["outputProfile"] = profile
+        if profile == "poi_fast":
+            pois, stats = _iter_poi_candidates(
+                view,
+                poi_count,
+                poi_min_score,
+                min_basic_blocks,
+                library_markers,
+                poi_keywords,
+            )
+            metadata.update(stats)
+            metadata["poiCandidates"] = pois
+        else:
+            functions, stats = _iter_control_flow(
+                view, max_functions, min_basic_blocks, library_markers
+            )
+            metadata.update(stats)
+            metadata["functions"] = functions
     except Exception as e:  # noqa: BLE001 - keep SBOM generation resilient
         logger.warning(f"binaryninja_info partial extraction for {filename}: {e}")
     finally:
