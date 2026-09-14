@@ -28,9 +28,9 @@ never blocked by a missing Binary Ninja install.
 from __future__ import annotations
 
 import contextlib
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-import math
 
 from loguru import logger
 
@@ -597,8 +597,7 @@ def binaryninja_info(sbom: SBOM, software: Software, filename: str, filetype: li
     profile = _get_str_setting(_SETTINGS_OUTPUT_PROFILE, _DEFAULT_OUTPUT_PROFILE).strip().lower()
     if profile not in {"full_cfg", "poi_fast"}:
         logger.warning(
-            f"binaryninja_info: unknown output_profile '{profile}'; "
-            f"using {_DEFAULT_OUTPUT_PROFILE}"
+            f"binaryninja_info: unknown output_profile '{profile}'; using {_DEFAULT_OUTPUT_PROFILE}"
         )
         profile = _DEFAULT_OUTPUT_PROFILE
 
