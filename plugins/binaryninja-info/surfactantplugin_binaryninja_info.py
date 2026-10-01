@@ -402,6 +402,7 @@ def _safe_len(value: Any) -> int:
         return len(value)
     return 0
 
+
 # pylint: disable-next=too-many-positional-arguments
 def _score_function(
     name: str,
@@ -459,6 +460,7 @@ def _score_function(
         reasons.append("tiny_wrapper_like")
 
     return round(score, 3), reasons
+
 
 # pylint: disable-next=too-many-positional-arguments
 def _iter_poi_candidates(
